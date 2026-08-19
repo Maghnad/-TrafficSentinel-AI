@@ -1,158 +1,210 @@
+"""SQLite persistence.
+
+Writes happen on a background thread with a bounded queue, for the same reason
+OCR does: a synchronous INSERT plus an fsync is 5-15 ms, and at 25 FPS with a
+busy junction that is enough to visibly hitch the loop. WAL mode also lets the
+dashboard read while the pipeline writes.
+
+The `status` column implements the two-tier enforcement model: violations above
+the auto-issue confidence threshold become challans, everything else lands in a
+human review queue. That is how real enforcement systems work, and it is the
+honest place to put an uncertain helmet call.
+"""
+
+from __future__ import annotations
+
+import queue
 import sqlite3
-import os
-import cv2
-import numpy as np
-from datetime import datetime
+import threading
+import time
+from pathlib import Path
+from typing import List, Optional
 
-class ViolationDatabase:
-    def __init__(self, db_path="violations.db", evidence_dir="evidence"):
-        self.db_path = db_path
-        self.evidence_dir = evidence_dir
-        
-        # Ensure evidence directory exists
-        if not os.path.exists(self.evidence_dir):
-            os.makedirs(self.evidence_dir)
-            
-        self._init_db()
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS violations (
+    violation_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             REAL    NOT NULL,
+    camera_id      TEXT    NOT NULL,
+    track_id       INTEGER,
+    violation_type TEXT    NOT NULL,
+    severity       TEXT,
+    confidence     REAL,
+    fine_amount    INTEGER,
+    plate_number   TEXT,
+    plate_conf     REAL,
+    status         TEXT    NOT NULL DEFAULT 'review',
+    measured_value REAL,
+    reasons        TEXT,
+    evidence_path  TEXT,
+    clip_path      TEXT,
+    latitude       REAL,
+    longitude      REAL
+);
+CREATE INDEX IF NOT EXISTS idx_v_type   ON violations(violation_type);
+CREATE INDEX IF NOT EXISTS idx_v_plate  ON violations(plate_number);
+CREATE INDEX IF NOT EXISTS idx_v_status ON violations(status);
+CREATE INDEX IF NOT EXISTS idx_v_ts     ON violations(ts);
 
-    def _init_db(self):
-        """Initialize the SQLite database and create tables if they don't exist."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS violations (
-                    violation_id TEXT PRIMARY KEY,
-                    timestamp TEXT,
-                    frame_idx INTEGER,
-                    violation_type TEXT,
-                    severity TEXT,
-                    confidence REAL,
-                    fine_amount INTEGER,
-                    plate_number TEXT,
-                    evidence_path TEXT
-                )
-            ''')
-            
-            # New table for the ANPR tracking network
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS sightings (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    plate_number TEXT,
-                    timestamp TEXT,
-                    camera_id TEXT,
-                    latitude REAL,
-                    longitude REAL,
-                    is_violation BOOLEAN
-                )
-            ''')
-            conn.commit()
+CREATE TABLE IF NOT EXISTS sightings (
+    sighting_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           REAL NOT NULL,
+    plate_number TEXT NOT NULL,
+    plate_norm   TEXT NOT NULL,
+    camera_id    TEXT,
+    latitude     REAL,
+    longitude    REAL,
+    is_violation INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_s_norm ON sightings(plate_norm);
 
-    def violation_exists(self, violation_id: str) -> bool:
-        """Check if a violation is already logged."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT 1 FROM violations WHERE violation_id = ?', (violation_id,))
-            return cursor.fetchone() is not None
+CREATE TABLE IF NOT EXISTS flow_stats (
+    ts         REAL,
+    camera_id  TEXT,
+    vehicles   INTEGER,
+    mean_speed REAL,
+    queue_len  INTEGER
+);
+"""
 
-    def add_violation(self, violation_id, frame_idx, violation_type, severity, confidence, fine_amount, plate_number, frame, bbox):
-        """Save evidence image and log violation to database."""
-        if self.violation_exists(violation_id):
-            return
 
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        evidence_path = ""
+def normalise_plate(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    return "".join(ch for ch in text.upper() if ch.isalnum())
 
-        # Crop and save evidence image
-        if frame is not None and bbox is not None:
+
+class Database:
+    def __init__(self, path: str, async_writes: bool = True):
+        self.path = str(path)
+        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        self._init_schema()
+        self._q: "queue.Queue[tuple]" = queue.Queue(maxsize=512)
+        self._stop = threading.Event()
+        self._thread = None
+        if async_writes:
+            self._thread = threading.Thread(target=self._writer, daemon=True)
+            self._thread.start()
+
+    def _connect(self) -> sqlite3.Connection:
+        con = sqlite3.connect(self.path, timeout=5.0,
+                              check_same_thread=False)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
+        con.row_factory = sqlite3.Row
+        return con
+
+    def _init_schema(self) -> None:
+        con = self._connect()
+        con.executescript(SCHEMA)
+        con.commit()
+        con.close()
+
+    # ------------------------------------------------------------------ #
+
+    def _writer(self) -> None:
+        con = self._connect()
+        pending: List[tuple] = []
+        last_flush = time.time()
+        while not self._stop.is_set() or not self._q.empty():
             try:
-                x1, y1, x2, y2 = [int(v) for v in bbox]
-                # Add a 20px margin around the crop for better context
-                h, w = frame.shape[:2]
-                x1 = max(0, x1 - 20)
-                y1 = max(0, y1 - 20)
-                x2 = min(w, x2 + 20)
-                y2 = min(h, y2 + 20)
-                
-                crop = frame[y1:y2, x1:x2]
-                if crop.size > 0:
-                    filename = f"{violation_id}.jpg"
-                    filepath = os.path.join(self.evidence_dir, filename)
-                    cv2.imwrite(filepath, crop)
-                    evidence_path = filepath
-            except Exception as e:
-                print(f"Failed to save evidence image: {e}")
-
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO violations 
-                (violation_id, timestamp, frame_idx, violation_type, severity, confidence, fine_amount, plate_number, evidence_path)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (violation_id, timestamp, frame_idx, violation_type, severity, confidence, fine_amount, plate_number, evidence_path))
-            conn.commit()
-
-    def get_all_violations(self, limit=100):
-        """Retrieve recent violations from the database."""
-        with sqlite3.connect(self.db_path) as conn:
-            # Return rows as dictionaries
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT * FROM violations 
-                ORDER BY timestamp DESC 
-                LIMIT ?
-            ''', (limit,))
-            return [dict(row) for row in cursor.fetchall()]
-
-    def get_recent_violations(self, limit=10):
-        """Alias for UI compatibility if needed."""
-        return self.get_all_violations(limit)
-
-    def clear_database(self):
-        """Delete all records from the database and optionally clear the evidence directory."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM violations')
-            cursor.execute('DELETE FROM sightings')
-            conn.commit()
-            
-        # Also delete all images in the evidence directory
-        if os.path.exists(self.evidence_dir):
-            for file in os.listdir(self.evidence_dir):
-                if file.endswith('.jpg'):
+                pending.append(self._q.get(timeout=0.2))
+            except queue.Empty:
+                pass
+            if pending and (len(pending) >= 16 or time.time() - last_flush > 0.5):
+                for sql, params in pending:
                     try:
-                        os.remove(os.path.join(self.evidence_dir, file))
-                    except Exception:
-                        pass
+                        con.execute(sql, params)
+                    except Exception as exc:
+                        print(f"[db] write failed: {exc}")
+                con.commit()
+                pending.clear()
+                last_flush = time.time()
+        con.commit()
+        con.close()
 
-    # --- ANPR TRACKING NETWORK METHODS ---
-    
-    def log_sighting(self, plate_number: str, camera_id: str, latitude: float, longitude: float, is_violation: bool = False):
-        """Log a vehicle sighting into the tracking network database."""
-        if not plate_number:
+    def _submit(self, sql: str, params: tuple) -> None:
+        try:
+            self._q.put_nowait((sql, params))
+        except queue.Full:
+            pass  # analytics rows are droppable; never stall the pipeline
+
+    # ------------------------------------------------------------------ #
+
+    def log_violation(self, *, camera_id, track_id, vtype, severity,
+                      confidence, fine, plate, plate_conf, status,
+                      measured_value, reasons, evidence_path, clip_path,
+                      lat, lon) -> None:
+        self._submit(
+            """INSERT INTO violations
+               (ts, camera_id, track_id, violation_type, severity, confidence,
+                fine_amount, plate_number, plate_conf, status, measured_value,
+                reasons, evidence_path, clip_path, latitude, longitude)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (time.time(), camera_id, track_id, vtype, severity, confidence,
+             fine, plate, plate_conf, status, measured_value,
+             " | ".join(reasons or []), evidence_path, clip_path, lat, lon))
+
+    def log_sighting(self, plate, camera_id, lat, lon, is_violation) -> None:
+        if not plate:
             return
-            
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO sightings 
-                (plate_number, timestamp, camera_id, latitude, longitude, is_violation)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (plate_number, timestamp, camera_id, latitude, longitude, is_violation))
-            conn.commit()
+        self._submit(
+            """INSERT INTO sightings
+               (ts, plate_number, plate_norm, camera_id, latitude, longitude,
+                is_violation) VALUES (?,?,?,?,?,?,?)""",
+            (time.time(), plate, normalise_plate(plate), camera_id, lat, lon,
+             int(bool(is_violation))))
 
-    def get_vehicle_route(self, plate_number: str):
-        """Retrieve the chronological route of a specific vehicle."""
-        clean_plate = plate_number.replace(" ", "").replace("-", "").upper()
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            # Remove spaces and hyphens from the stored plate_number on the fly to match the clean_plate
-            cursor.execute('''
-                SELECT * FROM sightings 
-                WHERE REPLACE(REPLACE(UPPER(plate_number), ' ', ''), '-', '') LIKE ? 
-                ORDER BY timestamp ASC
-            ''', (f"%{clean_plate}%",))
-            return [dict(row) for row in cursor.fetchall()]
+    def log_flow(self, camera_id, vehicles, mean_speed, queue_len) -> None:
+        self._submit(
+            "INSERT INTO flow_stats VALUES (?,?,?,?,?)",
+            (time.time(), camera_id, vehicles, mean_speed, queue_len))
 
+    # ------------------------------------------------------------------ #
+    # Reads (synchronous - dashboard side)
+    # ------------------------------------------------------------------ #
+
+    def query(self, sql: str, params: tuple = ()) -> List[sqlite3.Row]:
+        con = self._connect()
+        try:
+            return con.execute(sql, params).fetchall()
+        finally:
+            con.close()
+
+    def recent(self, limit: int = 200, status: Optional[str] = None):
+        if status:
+            return self.query(
+                "SELECT * FROM violations WHERE status=? "
+                "ORDER BY ts DESC LIMIT ?", (status, limit))
+        return self.query(
+            "SELECT * FROM violations ORDER BY ts DESC LIMIT ?", (limit,))
+
+    def vehicle_route(self, plate: str):
+        return self.query(
+            "SELECT * FROM sightings WHERE plate_norm=? ORDER BY ts",
+            (normalise_plate(plate),))
+
+    def set_status(self, violation_id: int, status: str) -> None:
+        con = self._connect()
+        con.execute("UPDATE violations SET status=? WHERE violation_id=?",
+                    (status, violation_id))
+        con.commit()
+        con.close()
+
+    def stats(self):
+        return {
+            "total": self.query("SELECT COUNT(*) c FROM violations")[0]["c"],
+            "issued": self.query(
+                "SELECT COUNT(*) c FROM violations WHERE status='issued'"
+            )[0]["c"],
+            "review": self.query(
+                "SELECT COUNT(*) c FROM violations WHERE status='review'"
+            )[0]["c"],
+            "fines": self.query(
+                "SELECT COALESCE(SUM(fine_amount),0) s FROM violations "
+                "WHERE status='issued'")[0]["s"],
+        }
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2.0)

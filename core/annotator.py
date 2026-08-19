@@ -1,207 +1,112 @@
-"""
-TrafficSentinel AI — Image Annotator
-Simple clean boxes with colored text labels — no backgrounds.
-Style: straight-edge rectangles, thin lines, label above top-left corner.
-"""
+"""Frame annotation. Kept deliberately cheap - drawing is 3-5 ms and it is easy
+to accidentally make it 30."""
+
+from __future__ import annotations
+
+import time
+from typing import Dict, List
 
 import cv2
 import numpy as np
-from datetime import datetime
-
-
-# ── Color Palette (BGR) ──────────────────────────────────────────────────
 
 COLORS = {
-    # Vehicles — each type gets a distinct color
-    "car": (0, 255, 0),            # Green
-    "motorcycle": (255, 178, 0),   # Cyan-ish
-    "bus": (178, 102, 255),        # Purple
-    "truck": (102, 255, 178),      # Teal
-    "bicycle": (0, 255, 255),      # Yellow
-    # Person — cycle through these
-    "person_colors": [
-        (0, 255, 0),       # Green
-        (255, 0, 255),     # Pink / Magenta
-        (255, 255, 0),     # Cyan
-        (0, 128, 255),     # Orange
-        (255, 0, 0),       # Blue
-        (0, 255, 255),     # Yellow
-    ],
-    # Traffic light
-    "traffic_light": (0, 0, 255),  # Red
-    # Violations
-    "HELMET_VIOLATION": (0, 0, 255),
-    "TRIPLE_RIDING": (0, 80, 255),
-    "RED_LIGHT_VIOLATION": (0, 0, 200),
-    "NO_PLATE_VISIBLE": (0, 165, 255),
-    "OVERCROWDING": (0, 100, 255),
-    # Helmet status
-    "HELMET": (0, 200, 0),
-    "NO_HELMET": (0, 0, 255),
-    "UNCERTAIN": (0, 200, 255),
+    "violation": (60, 60, 235),
+    "person": (235, 190, 60),
+    "motorcycle": (120, 220, 120),
+    "car": (200, 160, 90),
+    "bus": (180, 120, 200),
+    "truck": (120, 150, 220),
+    "bicycle": (150, 220, 200),
+    "traffic light": (90, 220, 235),
+    "default": (180, 180, 180),
 }
-
-# Counter for cycling person colors
-_person_color_idx = 0
+FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 
-def _next_person_color():
-    global _person_color_idx
-    colors = COLORS["person_colors"]
-    c = colors[_person_color_idx % len(colors)]
-    _person_color_idx += 1
-    return c
+def _label(img, text, org, color, scale=0.45):
+    (tw, th), base = cv2.getTextSize(text, FONT, scale, 1)
+    x, y = int(org[0]), int(org[1])
+    y = max(th + 4, y)
+    cv2.rectangle(img, (x, y - th - 4), (x + tw + 6, y + base - 1), color, -1)
+    cv2.putText(img, text, (x + 3, y - 2), FONT, scale, (255, 255, 255), 1,
+                cv2.LINE_AA)
 
 
-class ViolationAnnotator:
-    """Simple clean annotations — thin boxes, colored text, no backgrounds."""
+class Annotator:
+    def __init__(self, geometry, show_clean: bool = True):
+        self.geo = geometry
+        self.show_clean = show_clean
 
-    def __init__(self):
-        self.font = cv2.FONT_HERSHEY_SIMPLEX
-
-    def annotate_detections(self, image: np.ndarray, pipeline_results: dict,
-                             violations: list = None, show_all: bool = False) -> np.ndarray:
-        """Draw boxes with violation-aware labels.
-        Cross-references each detection with violations to show what rule it's breaking.
-        """
-        annotated = image.copy()
-        global _person_color_idx
-        _person_color_idx = 0  # Reset per frame
-
-        # Build a lookup: node_id → list of violation types
-        vio_by_node = {}
-        if violations:
-            for v in violations:
-                for nid in v.involved_nodes:
-                    vio_by_node.setdefault(nid, []).append(v)
-
-        for det_id, det in enumerate(pipeline_results["all_detections"]):
-            bbox = det["bbox"]
-            x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
-
-            category = det.get("category", "other")
-            if category == "other":
-                continue
-
-            # Check if this detection is involved in any violation
-            node_violations = vio_by_node.get(det_id, [])
-            has_violation = len(node_violations) > 0
-
-            # OPTIMIZATION: Hide innocent vehicles to reduce UI congestion
-            if not has_violation and not show_all:
-                continue
-
-            if category == "vehicle":
-                vtype = det.get("vehicle_type", "vehicle")
-                if has_violation:
-                    # Show violation type on the label
-                    vio_names = [v.violation_type.replace("_", " ") for v in node_violations]
-                    color = (0, 0, 255)  # Red for violations
-                    label = f"{vtype} | {' | '.join(vio_names)}"
-                else:
-                    color = COLORS.get(vtype, (0, 255, 0))
-                    label = f"{vtype} {det['confidence']:.0%}"
-
-            elif category == "person":
-                helmet = det.get("helmet_status", "")
-                if helmet == "NO_HELMET" or has_violation:
-                    color = COLORS["NO_HELMET"]  # Red
-                    if has_violation:
-                        vio_names = [v.violation_type.replace("_", " ") for v in node_violations]
-                        label = f"person | {' | '.join(vio_names)}"
-                    else:
-                        label = f"person [NO HELMET] {det['confidence']:.0%}"
-                elif helmet == "HELMET":
-                    color = COLORS["HELMET"]  # Green
-                    label = f"person [HELMET] {det['confidence']:.0%}"
-                else:
-                    color = _next_person_color()
-                    label = f"person {det['confidence']:.0%}"
-
-            elif category == "traffic_light":
-                tl_color = det.get("color", "UNKNOWN")
-                if tl_color == "RED":
-                    color = (0, 0, 255)
-                elif tl_color == "GREEN":
-                    color = (0, 200, 0)
-                else:
-                    color = (0, 200, 255)
-                label = f"signal: {tl_color}"
-            else:
-                continue
-
-            # Type-cast for OpenCV 4.11.0 strict typing
-            color_tuple = (int(color[0]), int(color[1]), int(color[2]))
-            
-            # Simple straight rectangle using uniform integer literal for thickness
-            cv2.rectangle(annotated, (int(x1), int(y1)), (int(x2), int(y2)), color_tuple, 1)
-
-            # Colored text above top-left — no background
-            cv2.putText(annotated, label, (int(x1), int(y1) - 5),
-                        self.font, 0.4, color_tuple, 1, cv2.LINE_AA)
-
-        return annotated
-
-    def annotate_violations(self, image: np.ndarray, violations: list) -> np.ndarray:
-        """Draw violation boxes with colored text label."""
-        annotated = image.copy()
-
+    def draw(self, frame, graph, violations, registry, hud: Dict) -> np.ndarray:
+        img = frame  # caller passes a copy
+        offenders = {}
         for v in violations:
-            bbox = v.evidence_bbox
-            x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
-            color = COLORS.get(v.violation_type, (0, 0, 255))
+            offenders.setdefault(v.track_id, []).append(v.vtype)
 
-            # Simple rectangle for violation
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 1)
+        self._draw_zones(img)
 
-            # Descriptive violation text — no background
-            short_type = v.violation_type.replace("_", " ")
-            label = f"{short_type} | Conf:{v.confidence:.0%} | Fine: Rs.{v.fine_amount}"
-            cv2.putText(annotated, label, (x1, y1 - 5),
-                        self.font, 0.45, color, 1, cv2.LINE_AA)
+        for node in graph.nodes.values():
+            det = node.det
+            tid = det["track_id"]
+            is_offender = tid in offenders
+            if not is_offender and not self.show_clean:
+                continue
 
-        return annotated
+            x1, y1, x2, y2 = [int(v) for v in det["bbox"]]
+            color = (COLORS["violation"] if is_offender
+                     else COLORS.get(det["label"], COLORS["default"]))
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2 if is_offender else 1)
 
-    def annotate_plates(self, image: np.ndarray, plates: list) -> np.ndarray:
-        """Draw plate text below vehicle box — colored, no background."""
-        annotated = image.copy()
+            parts = [f"{det['label']}#{tid}"]
+            tr = registry.get(tid)
+            if tr:
+                if tr.speed_kmh is not None:
+                    parts.append(f"{tr.speed_kmh:.0f}km/h")
+                if tr.plate:
+                    parts.append(tr.plate)
+            hs = node.attributes.get("helmet")
+            if hs and hs != "UNKNOWN":
+                parts.append(hs)
+            state = node.attributes.get("state")
+            if state and state != "UNKNOWN":
+                parts.append(state)
 
-        for plate in plates:
-            text = plate["text"]
-            conf = plate["confidence"]
-            vbbox = plate["vehicle_bbox"]
-            x1, y1, x2, y2 = int(vbbox[0]), int(vbbox[1]), int(vbbox[2]), int(vbbox[3])
+            _label(img, " ".join(parts), (x1, y1 - 4), color)
 
-            label = f"Plate: {text} {conf:.0%}"
-            cv2.putText(annotated, label, (x1, y2 + 28),
-                        self.font, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+            if is_offender:
+                _label(img, ",".join(offenders[tid]), (x1, y2 + 16),
+                       COLORS["violation"], 0.42)
 
-        return annotated
+        self._draw_hud(img, hud)
+        return img
 
-    def add_watermark(self, image: np.ndarray, camera_id: str = "CAM-001") -> np.ndarray:
-        """Small watermark text at bottom — no background."""
-        annotated = image.copy()
-        h, w = annotated.shape[:2]
+    def _draw_zones(self, img) -> None:
+        if self.geo.stop_line and len(self.geo.stop_line) == 2:
+            p1 = tuple(int(v) for v in self.geo.stop_line[0])
+            p2 = tuple(int(v) for v in self.geo.stop_line[1])
+            cv2.line(img, p1, p2, (0, 215, 255), 2)
+            _label(img, "STOP LINE", p1, (0, 160, 200), 0.4)
+        for poly in self.geo.no_parking_zones or []:
+            pts = np.asarray(poly, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(img, [pts], True, (90, 90, 220), 2)
 
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
-        watermark = f"TrafficSentinel AI | {camera_id} | {timestamp}"
+    def _draw_hud(self, img, hud: Dict) -> None:
+        h, w = img.shape[:2]
+        cv2.rectangle(img, (0, 0), (w, 28), (28, 28, 32), -1)
+        left = (f"{hud.get('camera_id','CAM')}  "
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')}")
+        cv2.putText(img, left, (8, 19), FONT, 0.5, (235, 235, 235), 1,
+                    cv2.LINE_AA)
 
-        cv2.putText(annotated, watermark, (4, h - 6),
-                    self.font, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
+        right = (f"FPS {hud.get('fps', 0):.1f} | "
+                 f"infer {hud.get('infer_ms', 0):.0f}ms | "
+                 f"OCR q{hud.get('ocr_backlog', 0)} | "
+                 f"signal {hud.get('light', 'UNKNOWN')} | "
+                 f"tracks {hud.get('tracks', 0)}")
+        (tw, _), _ = cv2.getTextSize(right, FONT, 0.45, 1)
+        cv2.putText(img, right, (max(8, w - tw - 8), 19), FONT, 0.45,
+                    (180, 220, 180), 1, cv2.LINE_AA)
 
-        return annotated
-
-    def create_full_annotation(
-        self,
-        image: np.ndarray,
-        pipeline_results: dict,
-        violations: list,
-        camera_id: str = "CAM-001",
-        show_all: bool = False
-    ) -> np.ndarray:
-        """Create fully annotated evidence image."""
-        annotated = self.annotate_detections(image, pipeline_results, violations, show_all)
-        annotated = self.annotate_violations(annotated, violations)
-        annotated = self.annotate_plates(annotated, pipeline_results.get("plates", []))
-        annotated = self.add_watermark(annotated, camera_id)
-        return annotated
+        if not hud.get("calibrated", False):
+            _label(img, "UNCALIBRATED - speed/wrong-way/near-miss disabled",
+                   (8, h - 10), (40, 120, 200), 0.5)

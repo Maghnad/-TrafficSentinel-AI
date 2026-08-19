@@ -1,9 +1,15 @@
-ultralytics>=8.0.0
-easyocr>=1.7.0
-streamlit>=1.28.0
-opencv-python-headless>=4.8.0
-numpy>=1.24.0
-Pillow>=10.0.0
-plotly>=5.18.0
-folium>=0.14.0
-streamlit-folium>=0.17.0
+﻿ultralytics>=8.3.0
+opencv-python>=4.9.0
+numpy>=1.26,<2.2
+easyocr>=1.7.1
+streamlit>=1.36
+plotly>=5.20
+folium>=0.16
+streamlit-folium>=0.20
+pandas>=2.2
+
+# CPU acceleration (strongly recommended - see README)
+# openvino>=2024.3
+# onnxruntime>=1.18
+imageio-ffmpeg>=0.5.0
+

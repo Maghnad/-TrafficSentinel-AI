@@ -1,8 +1,19 @@
-venv/
+.venv/
 __pycache__/
 *.pyc
-.env
-violations.db
-evidence/
+
+# Model weights and exports - regenerated on first run, do not commit
 *.pt
-test_crop.jpg
+*.onnx
+*.engine
+*_openvino_model/
+*_ncnn_model/
+models/
+
+# Runtime artefacts
+*.db
+*.db-wal
+*.db-shm
+evidence/
+_upload.mp4
+camera.json

@@ -1,30 +1,12 @@
 @echo off
-echo 🚦 Starting TrafficSentinel AI Setup...
-
-:: Check if Python is installed
-python --version >nul 2>&1
-IF %ERRORLEVEL% NEQ 0 (
-    echo ❌ Python could not be found. Please install Python 3.9+ to continue.
+REM Launch the dashboard. Assumes setup.bat has been run once.
+setlocal
+cd /d "%~dp0"
+if not exist ".venv" (
+    echo No .venv found. Run setup.bat first.
     pause
-    exit /b
+    exit /b 1
 )
-
-:: Create a virtual environment if it doesn't exist
-IF NOT EXIST "venv\Scripts\activate.bat" (
-    echo 📦 Creating virtual environment...
-    python -m venv venv
-)
-
-:: Activate virtual environment
-echo 🔄 Activating virtual environment...
-call venv\Scripts\activate.bat
-
-:: Install requirements
-echo 📥 Installing required packages...
-pip install -r requirements.txt
-
-:: Start the application
-echo 🚀 Launching TrafficSentinel AI Dashboard...
+call .venv\Scripts\activate.bat
 streamlit run app.py
-
 pause
