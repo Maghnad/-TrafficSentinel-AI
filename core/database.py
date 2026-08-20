@@ -1,4 +1,4 @@
-"""SQLite persistence.
+﻿"""SQLite persistence.
 
 Writes happen on a background thread with a bounded queue, for the same reason
 OCR does: a synchronous INSERT plus an fsync is 5-15 ms, and at 25 FPS with a
@@ -204,7 +204,27 @@ class Database:
                 "WHERE status='issued'")[0]["s"],
         }
 
+    def clear_all(self, clear_evidence: bool = True) -> None:
+        """Delete all violation logs, sightings, and flow statistics."""
+        con = self._connect()
+        con.execute("DELETE FROM violations")
+        con.execute("DELETE FROM sightings")
+        con.execute("DELETE FROM flow_stats")
+        con.commit()
+        con.close()
+
+        if clear_evidence:
+            for folder in ("evidence/crops", "evidence/clips"):
+                p = Path(folder)
+                if p.exists():
+                    for f in p.glob("*.*"):
+                        try:
+                            f.unlink()
+                        except Exception:
+                            pass
+
     def close(self) -> None:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=2.0)
+

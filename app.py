@@ -196,14 +196,24 @@ def page_live():
 # ---------------------------------------------------------------------- #
 
 def page_review():
-    st.header("Review Queue")
-    st.caption("Violations the system was not confident enough to auto-issue. "
-               "An officer confirms or dismisses. This is where UNCERTAIN "
-               "helmet calls and plate-less vehicles land.")
+    head_col1, head_col2 = st.columns([3, 1])
+    with head_col1:
+        st.header("Review Queue")
+        st.caption("Violations awaiting officer confirmation or dismissal before issuing challans.")
+    with head_col2:
+        st.write("")
+        with st.popover("🗑️ Clear All Logs", use_container_width=True):
+            st.warning("This will delete all violation logs, ANPR sightings, and evidence clips.")
+            if st.button("Confirm Delete All", type="primary", use_container_width=True):
+                st.cache_resource.clear()
+                db_inst = Database(cfg.db_path, async_writes=False)
+                db_inst.clear_all(clear_evidence=True)
+                st.success("All logs and evidence deleted successfully!")
+                st.rerun()
 
     rows = db.recent(100, status="review")
     if not rows:
-        st.info("Nothing awaiting review.")
+        st.info("No violations currently awaiting review.")
         return
 
     for r in rows:
@@ -396,6 +406,8 @@ PAGES = {
     "Calibration Status": page_calibration,
 }
 PAGES[page]()
+
+
 
 
 

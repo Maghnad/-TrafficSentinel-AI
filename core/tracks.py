@@ -87,20 +87,19 @@ class TrackRegistry:
         self._evict(frame_idx)
 
     def _update_kinematics(self, tr: Track) -> None:
-        """Speed in km/h from world-plane displacement.
-
-        Note the frame-index delta is used directly, so this stays correct
-        regardless of frame striding - the original `x FPS` formula silently
-        multiplied reported speed by the stride factor.
-        """
-        if len(tr.history) < 3 or not self.ground.calibrated:
+        """Speed in km/h from world-plane displacement with perspective stability."""
+        if len(tr.history) < 4 or not self.ground.calibrated:
             return
-        # Compare against a sample ~0.4 s back for a stable baseline.
-        lookback = max(2, int(self.fps * 0.4))
+        # Compare against a sample ~0.5 s back for stable speed estimation
+        lookback = max(3, int(self.fps * 0.5))
         idx = max(0, len(tr.history) - 1 - lookback)
-        f0, _, w0 = tr.history[idx]
-        f1, _, w1 = tr.history[-1]
+        f0, foot0, w0 = tr.history[idx]
+        f1, foot1, w1 = tr.history[-1]
         if w0 is None or w1 is None or f1 <= f0:
+            return
+
+        # Avoid horizon singularity where tiny pixel jitter causes huge displacement
+        if foot1[1] < 120 or foot0[1] < 120:
             return
 
         dt = (f1 - f0) / self.fps
@@ -108,11 +107,15 @@ class TrackRegistry:
             return
         dx, dy = w1[0] - w0[0], w1[1] - w0[1]
         dist = float(np.hypot(dx, dy))
-        tr.world_velocity = (dx / dt, dy / dt)
-        tr.speed_samples.append((dist / dt) * 3.6)
+        raw_speed = (dist / dt) * 3.6
+
+        # Filter unphysical single-frame glitch spikes (>160 km/h)
+        if raw_speed <= 160.0:
+            tr.world_velocity = (dx / dt, dy / dt)
+            tr.speed_samples.append(raw_speed)
 
         if len(tr.speed_samples) >= 3:
-            # Median, not mean: one bad box does not create a phantom fine.
+            # Rolling median across clean samples
             tr.speed_kmh = float(np.median(list(tr.speed_samples)))
 
     def _evict(self, frame_idx: int) -> None:
@@ -143,4 +146,5 @@ class TrackRegistry:
         if w_start is None or w_end is None:
             return None
         return (w_end[0] - w_start[0], w_end[1] - w_start[1])
+
 
