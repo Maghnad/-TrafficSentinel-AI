@@ -1,0 +1,78 @@
+﻿{
+  "detector": {
+    "weights": "yolov8n.pt",
+    "backend": "auto",
+    "imgsz": 480,
+    "conf": 0.35,
+    "iou": 0.5,
+    "device": "cpu",
+    "half": false,
+    "tracker": "bytetrack.yaml",
+    "frame_stride": 1
+  },
+  "ocr": {
+    "enabled": true,
+    "gpu": false,
+    "max_attempts_per_track": 12,
+    "min_crop_height": 40,
+    "queue_size": 8,
+    "plate_regex": "^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{3,4}$"
+  },
+  "helmet": {
+    "model_path": "models/helmet_cls.pt",
+    "conf_auto_issue": 0.8,
+    "head_crop_ratio": 0.3,
+    "min_head_px": 18
+  },
+  "rules": {
+    "speed_limit_kmh": 60.0,
+    "speed_min_track_frames": 6,
+    "triple_riding_min": 3,
+    "wrongway_min_displacement_m": 4.0,
+    "wrongway_dot_threshold": -0.55,
+    "nearmiss_ttc_s": 1.5,
+    "nearmiss_min_speed_kmh": 12.0,
+    "auto_issue_confidence": 0.65
+  },
+  "evidence": {
+    "root": "evidence",
+    "clip_seconds_before": 2.0,
+    "clip_seconds_after": 2.0,
+    "save_clips": true,
+    "crop_margin_px": 24,
+    "jpeg_quality": 88
+  },
+  "geometry": {
+    "camera_id": "CAM-01",
+    "latitude": 22.5726,
+    "longitude": 88.3639,
+    "_comment": "Calibrated for 4-lane road, 1280x720, camera elevated ~8m. Road: 14m wide x 55m visible depth.",
+    "homography_src": [
+      [160, 710],
+      [830, 710],
+      [690, 130],
+      [335, 130]
+    ],
+    "homography_dst": [
+      [0.0, 0.0],
+      [14.0, 0.0],
+      [14.0, 55.0],
+      [0.0, 55.0]
+    ],
+    "stop_line": [
+      [335, 200],
+      [690, 200]
+    ],
+    "lane_direction": [0.0, 1.0],
+    "no_parking_zones": [
+      [
+        [830, 400],
+        [1020, 400],
+        [1020, 715],
+        [830, 715]
+      ]
+    ],
+    "parking_dwell_seconds": 20.0
+  },
+  "db_path": "trafficsentinel.db"
+}
