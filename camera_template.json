@@ -1,4 +1,4 @@
-﻿{
+{
   "detector": {
     "weights": "yolov8n.pt",
     "backend": "auto",
@@ -46,30 +46,75 @@
     "camera_id": "CAM-01",
     "latitude": 22.5726,
     "longitude": 88.3639,
-    "_comment": "Calibrated for 4-lane road, 1280x720, camera elevated ~8m. Road: 14m wide x 55m visible depth.",
+    "_comment": "Calibrated for 4-lane road, 1280x720. Road: 14m wide x 30m visible depth.",
     "homography_src": [
-      [160, 710],
-      [830, 710],
-      [690, 130],
-      [335, 130]
+      [
+        160,
+        710
+      ],
+      [
+        830,
+        710
+      ],
+      [
+        690,
+        130
+      ],
+      [
+        335,
+        130
+      ]
     ],
     "homography_dst": [
-      [0.0, 0.0],
-      [14.0, 0.0],
-      [14.0, 55.0],
-      [0.0, 55.0]
+      [
+        0.0,
+        0.0
+      ],
+      [
+        14.0,
+        0.0
+      ],
+      [
+        14.0,
+        30.0
+      ],
+      [
+        0.0,
+        30.0
+      ]
     ],
     "stop_line": [
-      [335, 200],
-      [690, 200]
+      [
+        335,
+        200
+      ],
+      [
+        690,
+        200
+      ]
     ],
-    "lane_direction": [0.0, 1.0],
+    "lane_direction": [
+      0.0,
+      1.0
+    ],
     "no_parking_zones": [
       [
-        [830, 400],
-        [1020, 400],
-        [1020, 715],
-        [830, 715]
+        [
+          830,
+          400
+        ],
+        [
+          1020,
+          400
+        ],
+        [
+          1020,
+          715
+        ],
+        [
+          830,
+          715
+        ]
       ]
     ],
     "parking_dwell_seconds": 20.0
