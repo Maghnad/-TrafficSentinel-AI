@@ -115,7 +115,7 @@ class TrafficSentinel:
         """Submit crops per frame for vehicles that still need a plate or have unvalidated reads."""
         if not self.cfg.ocr.enabled:
             return
-        budget = 3
+        budget = 6 if self.annotator.show_clean else 3
         for vnode in graph.vehicles():
             if budget <= 0:
                 break
@@ -258,6 +258,7 @@ class TrafficSentinel:
         self.ocr.stop()
         self.evidence.stop()
         self.db.close()
+
 
 
 

@@ -1,4 +1,4 @@
-"""Frame annotation. Kept deliberately cheap - drawing is 3-5 ms and it is easy
+﻿"""Frame annotation. Kept deliberately cheap - drawing is 3-5 ms and it is easy
 to accidentally make it 30."""
 
 from __future__ import annotations
@@ -63,7 +63,9 @@ class Annotator:
                 if tr.speed_kmh is not None:
                     parts.append(f"{tr.speed_kmh:.0f}km/h")
                 if tr.plate:
-                    parts.append(tr.plate)
+                    parts.append(f"[{tr.plate}]")
+                elif tr.ocr_attempts > 0:
+                    parts.append("[OCR...]")
             hs = node.attributes.get("helmet")
             if hs and hs != "UNKNOWN":
                 parts.append(hs)
@@ -73,7 +75,11 @@ class Annotator:
 
             _label(img, " ".join(parts), (x1, y1 - 4), color)
 
-            if is_offender:
+            # Prominent plate badge for both clean and violating vehicles
+            if tr and tr.plate:
+                _label(img, f"Plate: {tr.plate} ({tr.plate_conf:.0%})", (x1, y2 + 16),
+                       (0, 220, 255), 0.42)
+            elif is_offender:
                 _label(img, ",".join(offenders[tid]), (x1, y2 + 16),
                        COLORS["violation"], 0.42)
 
@@ -110,3 +116,4 @@ class Annotator:
         if not hud.get("calibrated", False):
             _label(img, "UNCALIBRATED - speed/wrong-way/near-miss disabled",
                    (8, h - 10), (40, 120, 200), 0.5)
+
