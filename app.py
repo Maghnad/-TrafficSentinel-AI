@@ -102,7 +102,7 @@ cfg.rules.auto_issue_confidence = st.sidebar.slider(
     help="Violations below this go to the human review queue instead of "
          "becoming challans.")
 cfg.ocr.enabled = st.sidebar.checkbox("ANPR (plate reading)", cfg.ocr.enabled)
-show_clean = st.sidebar.checkbox("Show non-violating vehicles + ANPR Plates", True)
+show_clean = st.sidebar.checkbox("Show non-violating vehicles", True)
 
 st.sidebar.caption("Active rules")
 enabled_rules = {}
@@ -173,28 +173,7 @@ def page_live():
             m4.metric("Tracks", hud["tracks"])
             m5.metric("Signal", hud["light"])
 
-            if show_clean:
-                # Show ALL active vehicles (Non-Violating + Violating) with real-time ANPR plates
-                rows = []
-                for tr in list(engine.registry.tracks.values()):
-                    is_offender = bool(tr.logged)
-                    v_type = tr.vehicle_type or tr.label
-                    speed_str = f"{tr.speed_kmh:.0f} km/h" if tr.speed_kmh is not None else "-"
-                    plate_str = tr.plate if tr.plate else ("Reading OCR..." if tr.ocr_attempts > 0 else "Pending")
-                    conf_str = f"{tr.plate_conf:.0%}" if tr.plate else "-"
-                    status_str = "🚨 VIOLATION (" + ", ".join(list(tr.logged)) + ")" if is_offender else "✅ CLEAN (Non-Violating)"
-
-                    rows.append({
-                        "Track ID": f"#{tr.track_id}",
-                        "Vehicle": v_type,
-                        "Speed": speed_str,
-                        "Detected Plate (ANPR)": plate_str,
-                        "OCR Conf": conf_str,
-                        "Vehicle Status": status_str,
-                    })
-                if rows:
-                    feed_slot.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-            elif engine.live_violations:
+            if engine.live_violations:
                 rows = []
                 for v in list(engine.live_violations)[:12]:
                     rows.append({
@@ -206,7 +185,8 @@ def page_live():
                         "Fine": f"Rs {v['fine']}" if v["fine"] else "-",
                         "Why": " | ".join(v["reasons"][:2]),
                     })
-                feed_slot.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                feed_slot.dataframe(pd.DataFrame(rows),
+                                    use_container_width=True, hide_index=True)
     finally:
         video.stop()
 
@@ -426,7 +406,6 @@ PAGES = {
     "Calibration Status": page_calibration,
 }
 PAGES[page]()
-
 
 
 
