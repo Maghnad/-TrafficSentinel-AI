@@ -79,7 +79,7 @@ class TrafficSentinel:
         graph = self.builder.build(detections)
         violations = self.rules.evaluate(frame, graph, self.registry, frame_idx)
 
-        self._dispatch_ocr(frame, graph)
+        self._dispatch_ocr(frame, graph, violations)
         self._collect_ocr()
         new = self._commit(frame, violations, frame_idx)
 
@@ -119,7 +119,7 @@ class TrafficSentinel:
 
     # ------------------------------------------------------------------ #
 
-    def _dispatch_ocr(self, frame, graph) -> None:
+    def _dispatch_ocr(self, frame, graph, violations=None) -> None:
         """Two-stage plate detection:
 
         Stage 1 (from reference main.py): Run YOLOv8 license_plate_detector on
@@ -132,6 +132,12 @@ class TrafficSentinel:
         if not self.cfg.ocr.enabled:
             return
 
+        # Build list of track IDs that are in violation
+        violating_track_ids = set()
+        if violations:
+            for v in violations:
+                violating_track_ids.add(v.get("track_id"))
+
         # ----- Stage 1: Full-frame plate detection (reference main.py) -----
         # Build vehicle_track_ids list: [[x1, y1, x2, y2, track_id], ...]
         vehicle_bboxes = []
@@ -139,6 +145,10 @@ class TrafficSentinel:
         for vnode in graph.vehicles():
             tr = vnode.det.get("_track")
             if tr is None:
+                continue
+
+            # Optimization: Only process OCR for vehicles that have committed a violation
+            if tr.track_id not in violating_track_ids and not getattr(tr, 'logged', False):
                 continue
             x1, y1, x2, y2 = vnode.bbox
             vehicle_bboxes.append([x1, y1, x2, y2, tr.track_id])
@@ -176,6 +186,9 @@ class TrafficSentinel:
         # ----- Stage 2: Async fallback for vehicles still without plates -----
         budget = 3
         for vnode in graph.vehicles():
+            tr = vnode.det.get("_track")
+            if tr and tr.track_id not in violating_track_ids and not getattr(tr, 'logged', False):
+                continue
             if budget <= 0:
                 break
             tr = vnode.det.get("_track")
