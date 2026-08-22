@@ -46,23 +46,23 @@
     "camera_id": "CAM-01",
     "latitude": 22.5726,
     "longitude": 88.3639,
-    "_comment": "Calibrated for 4-lane road, 1280x720. Road: 14m wide x 30m visible depth.",
+    "_comment": "Calibrated for 4-lane road, scaled to 1920x1080. Road: 14m wide x 30m visible depth.",
     "homography_src": [
       [
-        160,
-        710
+        240,
+        1065
       ],
       [
-        830,
-        710
+        1245,
+        1065
       ],
       [
-        690,
-        130
+        1035,
+        195
       ],
       [
-        335,
-        130
+        502,
+        195
       ]
     ],
     "homography_dst": [
@@ -85,12 +85,12 @@
     ],
     "stop_line": [
       [
-        335,
-        200
+        502,
+        300
       ],
       [
-        690,
-        200
+        1035,
+        300
       ]
     ],
     "lane_direction": [
@@ -100,24 +100,32 @@
     "no_parking_zones": [
       [
         [
-          830,
-          400
+          1245,
+          600
         ],
         [
-          1020,
-          400
+          1530,
+          600
         ],
         [
-          1020,
-          715
+          1530,
+          1072
         ],
         [
-          830,
-          715
+          1245,
+          1072
         ]
       ]
     ],
     "parking_dwell_seconds": 20.0
   },
-  "db_path": "trafficsentinel.db"
+  "db_path": "trafficsentinel.db",
+  "alerts": {
+    "enabled": false,
+    "bot_token": "",
+    "chat_id": "",
+    "send_photos": true,
+    "min_confidence": 0.5,
+    "cooldown_seconds": 5.0
+  }
 }

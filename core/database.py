@@ -1,4 +1,4 @@
-﻿"""SQLite persistence.
+"""SQLite persistence.
 
 Writes happen on a background thread with a bounded queue, for the same reason
 OCR does: a synchronous INSERT plus an fsync is 5-15 ms, and at 25 FPS with a
@@ -158,6 +158,16 @@ class Database:
         self._submit(
             "INSERT INTO flow_stats VALUES (?,?,?,?,?)",
             (time.time(), camera_id, vehicles, mean_speed, queue_len))
+
+    def update_violation_plate(self, track_id: int, plate: str, plate_conf: float) -> None:
+        """Retroactively updates plate number on previously logged violations for this track."""
+        if not plate:
+            return
+        self._submit(
+            """UPDATE violations
+               SET plate_number = ?, plate_conf = ?
+               WHERE track_id = ? AND (plate_number IS NULL OR plate_number = '' OR plate_conf < ?)""",
+            (plate, plate_conf, track_id, plate_conf))
 
     # ------------------------------------------------------------------ #
     # Reads (synchronous - dashboard side)

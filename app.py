@@ -1,4 +1,4 @@
-﻿"""TrafficSentinel AI - dashboard.
+"""TrafficSentinel AI - dashboard.
 
 Note on frame rate: Streamlit's rerun model caps the *displayed* rate at
 roughly 10-15 FPS regardless of how fast the pipeline runs. That is a UI
@@ -21,6 +21,7 @@ from core.config import AppConfig, VIOLATION_META
 from core.database import Database
 from core.engine import TrafficSentinel
 from core.video_source import VideoSource
+from core.alerts import TelegramAlertService
 
 st.set_page_config(page_title="TrafficSentinel AI", page_icon="🚦",
                    layout="wide")
@@ -53,6 +54,11 @@ db = get_db(cfg.db_path)
 # ---------------------------------------------------------------------- #
 
 st.sidebar.title("🚦 TrafficSentinel AI")
+if st.sidebar.button("🔄 Reload Models & Cache", use_container_width=True):
+    st.cache_resource.clear()
+    st.success("Pipeline reloaded!")
+    st.rerun()
+
 page = st.sidebar.radio("View", [
     "Live Detection", "Review Queue", "Analytics", "ANPR Trace",
     "Calibration Status",
@@ -110,6 +116,25 @@ for vtype in VIOLATION_META:
     enabled_rules[vtype] = st.sidebar.checkbox(
         vtype.replace("_", " ").title(), True, key=f"rule_{vtype}")
 
+st.sidebar.divider()
+st.sidebar.subheader("📱 Police Alerts (Telegram)")
+with st.sidebar.expander("⚙️ Telegram Bot Settings", expanded=cfg.alerts.enabled):
+    cfg.alerts.enabled = st.checkbox("Enable Live Alerts", value=cfg.alerts.enabled)
+    cfg.alerts.bot_token = st.text_input("Bot Token", value=cfg.alerts.bot_token, type="password", help="From @BotFather on Telegram")
+    cfg.alerts.chat_id = st.text_input("Chat / Channel ID", value=cfg.alerts.chat_id, help="From @userinfobot on Telegram")
+    cfg.alerts.send_photos = st.checkbox("Attach Vehicle Crop Photo", value=cfg.alerts.send_photos)
+
+    if st.button("📨 Send Test Alert", use_container_width=True):
+        if not cfg.alerts.bot_token or not cfg.alerts.chat_id:
+            st.error("Enter Bot Token and Chat ID first!")
+        else:
+            with st.spinner("Sending test alert..."):
+                ok, msg = TelegramAlertService.send_test_alert(cfg.alerts.bot_token, cfg.alerts.chat_id)
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
+
 
 # ---------------------------------------------------------------------- #
 # Live detection
@@ -143,7 +168,8 @@ def page_live():
         return
 
     video = VideoSource(source, realtime=realtime).start()
-    engine = get_engine(str(cfg.detector.imgsz), video.fps)
+    mtime = Path("core/ocr_worker.py").stat().st_mtime
+    engine = get_engine(f"{cfg.detector.imgsz}_{mtime}", video.fps)
     engine.cfg = cfg
     engine.annotator.show_clean = show_clean
     for vtype, on in enabled_rules.items():
@@ -176,10 +202,12 @@ def page_live():
             if engine.live_violations:
                 rows = []
                 for v in list(engine.live_violations)[:12]:
+                    tr_obj = engine.registry.get(v["track_id"])
+                    live_p = (tr_obj.plate if tr_obj and tr_obj.plate else v.get("plate")) or "-"
                     rows.append({
                         "Type": v["type"],
                         "Track": v["track_id"],
-                        "Plate": v["plate"] or "-",
+                        "Plate": live_p,
                         "Conf": f"{v['confidence']:.2f}",
                         "Status": v["status"],
                         "Fine": f"Rs {v['fine']}" if v["fine"] else "-",
@@ -234,15 +262,24 @@ def page_review():
             with c2:
                 st.subheader(f"{r['violation_type']}  ·  "
                              f"track #{r['track_id']}")
-                st.write(f"**Plate:** {r['plate_number'] or 'not read'}   "
-                         f"**Confidence:** {r['confidence']:.2f}   "
-                         f"**Fine:** Rs {r['fine_amount']}")
+                st.write(f"**Fine:** Rs {r['fine_amount']}   |   **Confidence:** {r['confidence']:.2f}")
+                
+                curr_p = r['plate_number'] or ''
+                verified_p = st.text_input("License Plate", value=curr_p, key=f"p_{r['violation_id']}",
+                                           placeholder="e.g. UP80EJ5057")
+
                 st.write("**Reasoning chain**")
                 for reason in (r["reasons"] or "").split(" | "):
                     if reason:
                         st.write(f"- {reason}")
                 b1, b2 = st.columns(2)
-                if b1.button("Issue challan", key=f"i{r['violation_id']}"):
+                if b1.button("Issue challan", type="primary", key=f"i{r['violation_id']}"):
+                    if verified_p.strip() != curr_p:
+                        db_conn = db._connect()
+                        db_conn.execute("UPDATE violations SET plate_number=? WHERE violation_id=?",
+                                        (verified_p.strip().upper(), r["violation_id"]))
+                        db_conn.commit()
+                        db_conn.close()
                     db.set_status(r["violation_id"], "issued")
                     st.rerun()
                 if b2.button("Dismiss", key=f"d{r['violation_id']}"):

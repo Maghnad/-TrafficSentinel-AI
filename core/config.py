@@ -1,4 +1,4 @@
-﻿"""Central configuration. Everything tunable lives here, nothing is hardcoded
+"""Central configuration. Everything tunable lives here, nothing is hardcoded
 in the hot loop. Per-camera geometry is loaded from a calibration JSON produced
 by calibrate.py."""
 
@@ -30,6 +30,9 @@ class DetectorConfig:
 class OCRConfig:
     enabled: bool = True
     gpu: bool = False
+    # Path to fine-tuned YOLOv8 license plate detector model
+    plate_model_path: str = "models/license_plate_detector.pt"
+    plate_detector_conf: float = 0.25
     # Hard cap on OCR attempts per track. Once we have a regex-valid plate we
     # stop entirely for that vehicle.
     max_attempts_per_track: int = 12
@@ -92,6 +95,16 @@ class CameraGeometry:
 
 
 @dataclass
+class AlertConfig:
+    enabled: bool = False
+    bot_token: str = ""
+    chat_id: str = ""
+    send_photos: bool = True
+    min_confidence: float = 0.5
+    cooldown_seconds: float = 5.0
+
+
+@dataclass
 class AppConfig:
     detector: DetectorConfig = field(default_factory=DetectorConfig)
     ocr: OCRConfig = field(default_factory=OCRConfig)
@@ -99,6 +112,7 @@ class AppConfig:
     rules: RuleConfig = field(default_factory=RuleConfig)
     evidence: EvidenceConfig = field(default_factory=EvidenceConfig)
     geometry: CameraGeometry = field(default_factory=CameraGeometry)
+    alerts: AlertConfig = field(default_factory=AlertConfig)
     db_path: str = "trafficsentinel.db"
 
     @staticmethod

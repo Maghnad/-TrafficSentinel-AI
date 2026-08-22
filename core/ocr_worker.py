@@ -1,33 +1,29 @@
-"""Asynchronous ANPR -- India-Specific Lexicon-Constrained Pipeline.
+"""Asynchronous ANPR — adopts the exact logic from
+automatic-number-plate-recognition-python-yolov8 (main.py + util.py).
 
-Key improvements over the original positional character repair:
-  1. BH (Bharat Series) branch -- prevents corruption of YY BH #### XX plates.
-  2. State code lexicon scoring -- joint inference over positions 1-2 against the
-     37 valid state/UT codes, instead of independent per-character substitution.
-  3. Geographic prior -- WB-weighted scoring for Kolkata-belt deployments.
-  4. Plate colour classification -- HSV thresholding for vehicle class.
-  5. Two-line plate handling -- aspect ratio classification + horizontal projection.
-  6. NON_HSRP detection -- plates that fail OCR after max retries are logged as
-     CMVR Rule 50 violations instead of silent drops.
+Key pipeline (from reference project):
+  1. Run YOLOv8 license_plate_detector on the FULL FRAME
+  2. For each detected plate bbox, crop from frame
+  3. Grayscale → cv2.threshold(gray, 64, 255, THRESH_BINARY_INV)
+  4. EasyOCR readtext() on the thresholded crop
+  5. Positional format_license() mapping (chars 0,1,4,5,6 = letters; 2,3 = digits)
+  6. Assign plate to vehicle via get_car() containment check
 """
 
 from __future__ import annotations
 
 import queue
 import re
+import string
 import threading
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
 from .helmet import enhance_crop
 
-
-# ====================================================================== #
-# Data Classes
-# ====================================================================== #
 
 @dataclass
 class OCRJob:
@@ -40,265 +36,175 @@ class OCRResult:
     track_id: int
     plate: Optional[str]
     confidence: float
-    plate_colour: str = "UNKNOWN"       # WHITE / YELLOW / GREEN / BLACK / RED
-    vehicle_class: str = "UNKNOWN"      # PRIVATE / COMMERCIAL / EV / RENTAL / TEMP
-    is_hsrp: bool = True                # False if hand-painted / non-standard
-    format_type: str = "STANDARD"       # STANDARD / BH
 
 
-# ====================================================================== #
-# Indian State/UT Code Lexicon (37 valid codes + BH)
-# ====================================================================== #
+# ---------------------------------------------------------------------------
+# Character mapping dictionaries — verbatim from reference util.py
+# ---------------------------------------------------------------------------
 
-VALID_STATE_CODES: Set[str] = {
-    "AN", "AP", "AR", "AS", "BR", "CG", "CH", "DD", "DL", "GA",
-    "GJ", "HP", "HR", "JH", "JK", "KA", "KL", "LA", "LD", "MH",
-    "ML", "MN", "MP", "MZ", "NL", "OD", "PB", "PY", "RJ", "SK",
-    "TN", "TR", "TS", "UK", "UP", "WB",
+dict_char_to_int = {'O': '0',
+                    'I': '1',
+                    'J': '3',
+                    'A': '4',
+                    'G': '6',
+                    'S': '5'}
+
+dict_int_to_char = {'0': 'O',
+                    '1': 'I',
+                    '3': 'J',
+                    '4': 'A',
+                    '6': 'G',
+                    '5': 'S'}
+
+# Extended mappings for Indian plates (additional confusions)
+dict_char_to_int_ext = {
+    'O': '0', 'D': '0', 'Q': '0',
+    'I': '1', 'L': '1', 'T': '1',
+    'Z': '2', 'J': '3', 'A': '4',
+    'S': '5', 'G': '6', 'B': '8'
 }
 
-# Geographic prior: probability weights for Kolkata-belt deployment.
-# WB dominates, then neighbouring states on interstate corridors.
-GEO_PRIOR: Dict[str, float] = {
-    "WB": 5.0,    # West Bengal -- home state
-    "BR": 2.0,    # Bihar -- adjacent
-    "JH": 2.0,    # Jharkhand -- adjacent
-    "OD": 1.8,    # Odisha -- adjacent
-    "AS": 1.5,    # Assam -- NE corridor
-    "UP": 1.3,    # Uttar Pradesh -- national highway traffic
-    "DL": 1.2,    # Delhi -- commercial/interstate
-    "MH": 1.1,    # Maharashtra -- commercial
-    "BH": 1.5,    # Bharat series -- urban newer vehicles
-}
-DEFAULT_GEO_WEIGHT = 0.5  # All other states
-
-
-# Character confusion maps (bidirectional optical similarities)
-CHAR_CONFUSIONS: Dict[str, str] = {
-    '0': 'O', 'O': '0', 'D': '0', 'Q': '0',
-    '1': 'I', 'I': '1', 'L': '1',
-    '2': 'Z', 'Z': '2',
-    '5': 'S', 'S': '5',
-    '8': 'B', 'B': '8',
-    '6': 'G', 'G': '6',
+dict_int_to_char_ext = {
+    '0': 'O', '1': 'I', '2': 'Z',
+    '3': 'J', '4': 'A', '5': 'S',
+    '6': 'G', '7': 'U', '8': 'B'
 }
 
 
-def _char_similarity(a: str, b: str) -> float:
-    """Score how likely OCR would confuse character a with character b."""
-    if a == b:
-        return 1.0
-    if CHAR_CONFUSIONS.get(a) == b or CHAR_CONFUSIONS.get(b) == a:
-        return 0.7
-    return 0.0
+# ---------------------------------------------------------------------------
+# Functions — verbatim from reference util.py
+# ---------------------------------------------------------------------------
 
-
-def _score_state_code(c1: str, c2: str, geo_prior: Dict[str, float]) -> Tuple[str, float]:
-    """Score the two-character read against all valid state codes using joint
-    character similarity and geographic prior. Returns (best_code, score)."""
-    best_code, best_score = c1 + c2, 0.0
-
-    for code in VALID_STATE_CODES:
-        sim = _char_similarity(c1, code[0]) * _char_similarity(c2, code[1])
-        if sim <= 0.0:
-            continue
-        geo = geo_prior.get(code, DEFAULT_GEO_WEIGHT)
-        score = sim * geo
-        if score > best_score:
-            best_score = score
-            best_code = code
-
-    return best_code, best_score
-
-
-# ====================================================================== #
-# BH (Bharat Series) Detection and Validation
-# ====================================================================== #
-
-# BH format: YY BH #### XX  (year, BH, 4 digits, 1-2 letters excluding I and O)
-BH_REGEX = re.compile(r'^[0-9]{2}BH[0-9]{4}[A-HJ-NP-Z]{1,2}$')
-
-# BH trailing letters explicitly exclude I and O to avoid 1/0 confusion
-BH_FORBIDDEN_TRAILING = {'I', 'O'}
-
-
-def _is_bh_candidate(text: str) -> bool:
-    """Check if positions 3-4 read as BH (before any positional repair)."""
-    if len(text) < 8:
-        return False
-    return text[2:4] in ('BH', '8H', 'B4', '84', 'BN', '8N')
-
-
-def _fix_bh_plate(text: str) -> str:
-    """Apply BH-specific disambiguation rules."""
-    chars = list(text)
-    n = len(chars)
-    if n < 8:
-        return text
-
-    c2d = {'O': '0', 'D': '0', 'Q': '0', 'I': '1', 'L': '1',
-           'Z': '2', 'S': '5', 'B': '8', 'G': '6'}
-    d2l = {'0': 'D', '1': 'J', '5': 'S', '8': 'B'}
-
-    # Positions 0-1: registration year digits
-    for i in (0, 1):
-        if chars[i] in c2d:
-            chars[i] = c2d[chars[i]]
-
-    # Positions 2-3: must be "BH"
-    chars[2] = 'B'
-    chars[3] = 'H'
-
-    # Positions 4-7: four digits
-    for i in range(4, min(8, n)):
-        if chars[i] in c2d:
-            chars[i] = c2d[chars[i]]
-
-    # Positions 8+: trailing letters (I and O forbidden by regulation)
-    for i in range(8, n):
-        if chars[i] == 'I':
-            chars[i] = 'J'
-        elif chars[i] == 'O':
-            chars[i] = 'D'
-        elif chars[i] in d2l:
-            chars[i] = d2l[chars[i]]
-
-    return ''.join(chars)
-
-
-# ====================================================================== #
-# Standard Plate Disambiguation (with Lexicon Scoring)
-# ====================================================================== #
-
-def disambiguate_indian_plate(text: str, geo_prior: Optional[Dict[str, float]] = None) -> str:
-    """Lexicon-constrained disambiguation for Indian license plates.
-
-    Handles both standard state-series (XX ## XXXX) and Bharat series (## BH #### XX).
-    Uses joint state code scoring instead of independent per-character substitution.
+def license_complies_format(text: str) -> bool:
+    """Check if the license plate text complies with the required format.
+    Reference format: 7 chars — LL DD LLL (e.g. AB12CDE)
     """
+    if len(text) != 7:
+        return False
+
+    if (text[0] in string.ascii_uppercase or text[0] in dict_int_to_char.keys()) and \
+       (text[1] in string.ascii_uppercase or text[1] in dict_int_to_char.keys()) and \
+       (text[2] in ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'] or text[2] in dict_char_to_int.keys()) and \
+       (text[3] in ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'] or text[3] in dict_char_to_int.keys()) and \
+       (text[4] in string.ascii_uppercase or text[4] in dict_int_to_char.keys()) and \
+       (text[5] in string.ascii_uppercase or text[5] in dict_int_to_char.keys()) and \
+       (text[6] in string.ascii_uppercase or text[6] in dict_int_to_char.keys()):
+        return True
+    else:
+        return False
+
+
+def format_license(text: str) -> str:
+    """Format the license plate text by converting characters using the mapping
+    dictionaries — verbatim from reference util.py."""
+    license_plate_ = ''
+    mapping = {0: dict_int_to_char, 1: dict_int_to_char,
+               4: dict_int_to_char, 5: dict_int_to_char, 6: dict_int_to_char,
+               2: dict_char_to_int, 3: dict_char_to_int}
+    for j in [0, 1, 2, 3, 4, 5, 6]:
+        if text[j] in mapping[j].keys():
+            license_plate_ += mapping[j][text[j]]
+        else:
+            license_plate_ += text[j]
+    return license_plate_
+
+
+def read_license_plate_ref(reader, license_plate_crop) -> Tuple[Optional[str], float]:
+    """Read the license plate text from the given cropped image — verbatim
+    logic from reference util.py read_license_plate()."""
+    detections = reader.readtext(license_plate_crop)
+
+    for detection in detections:
+        bbox, text, score = detection
+        text = text.upper().replace(' ', '')
+
+        if license_complies_format(text):
+            return format_license(text), score
+
+    return None, 0.0
+
+
+def get_car(license_plate_bbox, vehicle_bboxes_with_ids):
+    """Retrieve the vehicle coordinates and ID based on the license plate
+    coordinates — verbatim from reference util.py."""
+    x1, y1, x2, y2 = license_plate_bbox
+
+    for vbox in vehicle_bboxes_with_ids:
+        xcar1, ycar1, xcar2, ycar2, car_id = vbox
+        if x1 > xcar1 and y1 > ycar1 and x2 < xcar2 and y2 < ycar2:
+            return xcar1, ycar1, xcar2, ycar2, car_id
+
+    return -1, -1, -1, -1, -1
+
+
+# ---------------------------------------------------------------------------
+# Extended Indian plate disambiguation (handles 9-10 char Indian plates
+# that the 7-char reference format doesn't cover)
+# ---------------------------------------------------------------------------
+
+def disambiguate_indian_plate(text: str) -> str:
+    """Format and disambiguate license plate text for Indian RTO syntax."""
     t = re.sub(r'[^A-Z0-9]', '', text.upper())
-    if len(t) < 7 or len(t) > 11:
+    if len(t) < 6 or len(t) > 11:
         return t
 
-    prior = geo_prior or GEO_PRIOR
-
-    # Branch: detect BH plates BEFORE applying state-code rules
-    if _is_bh_candidate(t):
-        fixed = _fix_bh_plate(t)
-        if BH_REGEX.match(fixed):
-            return fixed
-
-    # Standard state-series plate
     chars = list(t)
     n = len(chars)
 
-    # 1. Joint state code scoring (positions 0-1)
-    best_code, score = _score_state_code(chars[0], chars[1], prior)
-    if score > 0.0:
-        chars[0], chars[1] = best_code[0], best_code[1]
+    # 1. State code (first 2 always letters)
+    for i in (0, 1):
+        if chars[i] in dict_int_to_char_ext:
+            chars[i] = dict_int_to_char_ext[chars[i]]
 
-    # 2. District code at position 2 (always a digit)
-    c2d = {'O': '0', 'D': '0', 'Q': '0', 'I': '1', 'L': '1',
-           'Z': '2', 'S': '5', 'B': '8', 'G': '6'}
-    if chars[2] in c2d:
-        chars[2] = c2d[chars[2]]
+    # 2. Position 2 always a digit
+    if chars[2] in dict_char_to_int_ext:
+        chars[2] = dict_char_to_int_ext[chars[2]]
 
-    # 3. Last 4 characters are registration digits
+    # 3. Last 4 always digits
     for i in range(max(3, n - 4), n):
-        if chars[i] in c2d:
-            chars[i] = c2d[chars[i]]
+        if chars[i] in dict_char_to_int_ext:
+            chars[i] = dict_char_to_int_ext[chars[i]]
+
+    # 4. Standard 10-char (UP12AA7855): pos 3 = digit, pos 4,5 = letters
+    if n == 10:
+        if chars[3] in dict_char_to_int_ext:
+            chars[3] = dict_char_to_int_ext[chars[3]]
+        for i in (4, 5):
+            if chars[i] in dict_int_to_char_ext:
+                chars[i] = dict_int_to_char_ext[chars[i]]
+    elif n == 9:
+        for i in range(max(3, n - 4), n):
+            if chars[i] in dict_char_to_int_ext:
+                chars[i] = dict_char_to_int_ext[chars[i]]
 
     return ''.join(chars)
 
 
-# ====================================================================== #
-# Plate Colour Classification (HSV Thresholding)
-# ====================================================================== #
-
-def classify_plate_colour(crop: np.ndarray) -> Tuple[str, str]:
-    """Classify plate background colour using HSV thresholding.
-
-    Returns (colour, vehicle_class):
-        WHITE  -> PRIVATE
-        YELLOW -> COMMERCIAL
-        GREEN  -> EV
-        BLACK  -> RENTAL
-        RED    -> TEMPORARY
-    """
-    if crop is None or crop.size == 0:
-        return "UNKNOWN", "UNKNOWN"
-
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    h, s, v = cv2.split(hsv)
-    total = max(1, h.size)
-
-    white_ratio = np.count_nonzero((s < 60) & (v > 160)) / total
-    yellow_ratio = np.count_nonzero((h >= 15) & (h <= 35) & (s > 80) & (v > 120)) / total
-    green_ratio = np.count_nonzero((h >= 35) & (h <= 85) & (s > 50) & (v > 80)) / total
-    black_ratio = np.count_nonzero(v < 60) / total
-    red_ratio = np.count_nonzero(((h < 10) | (h > 170)) & (s > 80) & (v > 80)) / total
-
-    ratios = {"WHITE": white_ratio, "YELLOW": yellow_ratio, "GREEN": green_ratio,
-              "BLACK": black_ratio, "RED": red_ratio}
-    colour = max(ratios, key=ratios.get)
-    if ratios[colour] < 0.15:
-        colour = "UNKNOWN"
-
-    c2c = {"WHITE": "PRIVATE", "YELLOW": "COMMERCIAL", "GREEN": "EV",
-           "BLACK": "RENTAL", "RED": "TEMPORARY", "UNKNOWN": "UNKNOWN"}
-    return colour, c2c[colour]
-
-
-# ====================================================================== #
-# Two-Line Plate Splitter
-# ====================================================================== #
-
-def _split_two_line(crop: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """Split a two-line plate into top and bottom halves using horizontal projection.
-
-    Two-line plates (common on two-wheelers, ~95% of bikes) have aspect ratio ~2:1
-    vs single-line ~4.5:1. The gap between lines appears as a valley in the
-    horizontal projection of edge density.
-    """
-    h, w = crop.shape[:2]
-    if w / max(1, h) > 3.0:
-        return None
-
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
-    edges = cv2.Canny(gray, 50, 150)
-    proj = np.sum(edges, axis=1).astype(float)
-
-    s, e = int(h * 0.3), int(h * 0.7)
-    if e <= s + 2:
-        return None
-    region = proj[s:e]
-    if region.size == 0:
-        return None
-
-    gap = s + int(np.argmin(region))
-    if proj[gap] > 0.3 * np.max(proj):
-        return None
-
-    top, bottom = crop[:gap, :], crop[gap:, :]
-    if top.size == 0 or bottom.size == 0:
-        return None
-    return top, bottom
-
-
-# ====================================================================== #
-# Plate Reader (Core OCR Engine)
-# ====================================================================== #
+# ---------------------------------------------------------------------------
+# PlateReader — uses the reference project's exact pipeline
+# ---------------------------------------------------------------------------
 
 class PlateReader:
-    """Owns the EasyOCR reader and the India-specific pre/post-processing."""
-
-    STANDARD_REGEX = re.compile(r'^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{3,4}$')
-    BH_REGEX_PAT = BH_REGEX
+    """YOLOv8 plate localizer + EasyOCR reader using the exact pipeline from
+    the reference automatic-number-plate-recognition-python-yolov8 project."""
 
     def __init__(self, cfg):
         self.cfg = cfg
         self.regex = re.compile(cfg.plate_regex)
         self._reader = None
+        self._plate_detector = None
+        self._init_detector()
+
+    def _init_detector(self):
+        model_path = getattr(self.cfg, "plate_model_path", "models/license_plate_detector.pt")
+        from pathlib import Path
+        if model_path and Path(model_path).exists():
+            try:
+                from ultralytics import YOLO
+                self._plate_detector = YOLO(model_path)
+                print(f"[anpr] loaded YOLOv8 license plate detector: {model_path}")
+            except Exception as exc:
+                print(f"[anpr] warning: could not load plate detector {model_path}: {exc}")
 
     def _lazy(self):
         if self._reader is None:
@@ -306,125 +212,208 @@ class PlateReader:
             self._reader = easyocr.Reader(["en"], gpu=self.cfg.gpu, verbose=False)
         return self._reader
 
-    @staticmethod
-    def _prep(crop: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    # ------------------------------------------------------------------ #
+    # FULL-FRAME plate detection — the key logic from reference main.py
+    # ------------------------------------------------------------------ #
+
+    def detect_plates_in_frame(self, frame: np.ndarray) -> List[dict]:
+        """Run YOLOv8 license_plate_detector on the FULL FRAME (exactly like
+        reference main.py line: license_plates = license_plate_detector(frame)[0]).
+
+        Returns list of dicts: {bbox: [x1,y1,x2,y2], bbox_score: float,
+                                text: str|None, text_score: float}
+        """
+        if self._plate_detector is None or frame is None or frame.size == 0:
+            return []
+
+        try:
+            conf_thresh = getattr(self.cfg, "plate_detector_conf", 0.20)
+            results = self._plate_detector.predict(frame, conf=conf_thresh, verbose=False)
+            if not results or len(results[0].boxes) == 0:
+                return []
+        except Exception:
+            return []
+
+        reader = self._lazy()
+        plates = []
+
+        for box in results[0].boxes:
+            x1, y1, x2, y2 = [int(round(v)) for v in box.xyxy[0].cpu().numpy()]
+            score = float(box.conf)
+
+            # Crop license plate from frame — exactly like reference main.py:
+            # license_plate_crop = frame[int(y1):int(y2), int(x1):int(x2), :]
+            h_img, w_img = frame.shape[:2]
+            cx1 = max(0, x1)
+            cy1 = max(0, y1)
+            cx2 = min(w_img, x2)
+            cy2 = min(h_img, y2)
+            license_plate_crop = frame[cy1:cy2, cx1:cx2]
+
+            if license_plate_crop.size == 0:
+                continue
+
+            # Process license plate — exactly like reference main.py:
+            # license_plate_crop_gray = cv2.cvtColor(license_plate_crop, cv2.COLOR_BGR2GRAY)
+            # _, license_plate_crop_thresh = cv2.threshold(license_plate_crop_gray, 64, 255, cv2.THRESH_BINARY_INV)
+            license_plate_crop_gray = cv2.cvtColor(license_plate_crop, cv2.COLOR_BGR2GRAY)
+            _, license_plate_crop_thresh = cv2.threshold(
+                license_plate_crop_gray, 64, 255, cv2.THRESH_BINARY_INV)
+
+            # Read license plate number — exactly like reference main.py:
+            # license_plate_text, license_plate_text_score = read_license_plate(license_plate_crop_thresh)
+            license_plate_text, license_plate_text_score = read_license_plate_ref(
+                reader, license_plate_crop_thresh)
+
+            # If reference format didn't match, try extended Indian pipeline
+            if license_plate_text is None:
+                license_plate_text, license_plate_text_score = self._read_indian(
+                    license_plate_crop)
+
+            plates.append({
+                "bbox": [cx1, cy1, cx2, cy2],
+                "bbox_score": score,
+                "text": license_plate_text,
+                "text_score": license_plate_text_score or 0.0,
+            })
+
+        return plates
+
+    # ------------------------------------------------------------------ #
+    # Per-crop OCR fallback (for async worker when full-frame isn't available)
+    # ------------------------------------------------------------------ #
+
+    def isolate_plate(self, vehicle_crop: np.ndarray) -> np.ndarray:
+        """Runs YOLOv8-plate on the vehicle crop to get a tight bounding box."""
+        if self._plate_detector is None or vehicle_crop is None or vehicle_crop.size == 0:
+            return vehicle_crop
+
+        h, w = vehicle_crop.shape[:2]
+        if h < 20 or w < 20:
+            return vehicle_crop
+
+        try:
+            conf_thresh = getattr(self.cfg, "plate_detector_conf", 0.20)
+            results = self._plate_detector.predict(vehicle_crop, imgsz=320,
+                                                    conf=conf_thresh, verbose=False)
+            if not results or len(results[0].boxes) == 0:
+                return vehicle_crop
+
+            boxes = results[0].boxes
+            best_idx = int(boxes.conf.cpu().numpy().argmax())
+            x1, y1, x2, y2 = [int(round(v)) for v in boxes.xyxy[best_idx].cpu().numpy()]
+
+            pad_x = max(2, int((x2 - x1) * 0.06))
+            pad_y = max(2, int((y2 - y1) * 0.08))
+            px1, py1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+            px2, py2 = min(w, x2 + pad_x), min(h, y2 + pad_y)
+
+            if px2 > px1 and py2 > py1:
+                plate_sub = vehicle_crop[py1:py2, px1:px2]
+                if plate_sub.size > 0:
+                    return plate_sub
+        except Exception:
+            pass
+        return vehicle_crop
+
+    def _read_indian(self, crop: np.ndarray) -> Tuple[Optional[str], float]:
+        """Extended multi-pass OCR for Indian plates (9-10 chars)."""
+        if crop is None or crop.size == 0:
+            return None, 0.0
+
+        reader = self._lazy()
+        best_text, best_conf = None, 0.0
+
+        # Prepare multiple image variants for OCR
         h, w = crop.shape[:2]
-        scale = min(3.0, max(1.0, 320.0 / max(1, w)))
-        if scale > 1.05:
-            crop = cv2.resize(crop, None, fx=scale, fy=scale,
-                              interpolation=cv2.INTER_CUBIC)
-        crop = enhance_crop(crop)
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        target_h = max(80, min(140, int(h * 3.0)))
+        scale = target_h / max(1, h)
+        upscaled = cv2.resize(crop, (int(w * scale), target_h),
+                               interpolation=cv2.INTER_CUBIC)
+        upscaled = enhance_crop(upscaled)
+
+        gray = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
         denoised = cv2.bilateralFilter(gray, 7, 55, 55)
         _, otsu = cv2.threshold(denoised, 0, 255,
                                 cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        return denoised, otsu
+        _, bin_inv = cv2.threshold(gray, 64, 255, cv2.THRESH_BINARY_INV)
 
-    def _normalise(self, text: str) -> str:
-        return re.sub(r'[^A-Z0-9]', '', text.upper())
-
-    def _ocr_image(self, image: np.ndarray) -> Tuple[str, float]:
-        """Run EasyOCR with beam search on a single image."""
-        reader = self._lazy()
-        try:
-            results = reader.readtext(
-                image, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -',
-                detail=1, paragraph=False, decoder='beamsearch', beamWidth=5)
-        except Exception:
-            return "", 0.0
-        if not results:
-            return "", 0.0
-        results.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
-        raw = self._normalise(''.join(r[1] for r in results))
-        conf = float(np.mean([r[2] for r in results]))
-        return raw, conf
-
-    def read(self, crop: np.ndarray) -> Tuple[Optional[str], float, str, str, bool]:
-        """Read a license plate from a bumper crop.
-
-        Returns (plate_text, confidence, plate_colour, vehicle_class, is_hsrp).
-        """
-        if crop is None or crop.size == 0:
-            return None, 0.0, "UNKNOWN", "UNKNOWN", True
-
-        # Plate colour classification
-        plate_colour, vehicle_class = classify_plate_colour(crop)
-
-        # Preprocess
-        gray, otsu = self._prep(crop)
-
-        # Try two-line split first (for two-wheelers)
-        split = _split_two_line(crop)
-        best_text, best_conf = None, 0.0
-
-        # If two-line split succeeded, OCR each half and concatenate
-        if split is not None:
-            top_crop, bot_crop = split
-            parts, total_conf = [], 0.0
-            for part in (top_crop, bot_crop):
-                ph, pw = part.shape[:2]
-                if pw < 10 or ph < 5:
-                    continue
-                p_gray = cv2.cvtColor(part, cv2.COLOR_BGR2GRAY) \
-                    if len(part.shape) == 3 else part
-                p_dn = cv2.bilateralFilter(p_gray, 7, 55, 55)
-                t, c = self._ocr_image(p_dn)
-                if t:
-                    parts.append(t)
-                    total_conf += c
-            if parts:
-                joined = ''.join(parts)
-                avg_conf = total_conf / len(parts)
-                if len(joined) >= 5 and avg_conf > best_conf:
-                    best_text, best_conf = joined, avg_conf
-
-        # Standard single-pass OCR (two passes: bilateral + Otsu)
-        for image in (gray, otsu):
-            raw, conf = self._ocr_image(image)
-            if not raw:
+        for image in (upscaled, denoised, otsu, bin_inv):
+            try:
+                results = reader.readtext(
+                    image,
+                    allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+                    detail=1, paragraph=False,
+                    text_threshold=0.18, low_text=0.12)
+            except Exception:
                 continue
-            if conf > best_conf and len(raw) >= 5:
-                best_text, best_conf = raw, conf
-            if conf > 0.70:
-                break
+            if not results:
+                continue
 
-        if not best_text:
-            return None, 0.0, plate_colour, vehicle_class, True
+            # Sort top-to-bottom, left-to-right for multi-line plates
+            results.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
+            raw = re.sub(r'[^A-Z0-9]', '',
+                         ''.join(r[1] for r in results).upper())
+            conf = float(np.mean([r[2] for r in results]))
 
-        # Apply India-specific disambiguation
-        # Constraint: yellow plate can never be BH (commercial not eligible)
-        allow_bh = (plate_colour != "YELLOW")
-        corrected = best_text
+            if not raw or len(raw) < 5:
+                continue
 
-        if allow_bh and _is_bh_candidate(best_text):
-            corrected = _fix_bh_plate(best_text)
-            if self.BH_REGEX_PAT.match(corrected):
-                return corrected, max(best_conf, 0.85), plate_colour, vehicle_class, True
-        else:
-            corrected = disambiguate_indian_plate(best_text, GEO_PRIOR)
+            corrected = disambiguate_indian_plate(raw)
 
-        if self.regex.match(corrected) or self.STANDARD_REGEX.match(corrected):
-            return corrected, max(best_conf, 0.85), plate_colour, vehicle_class, True
-        if self.BH_REGEX_PAT.match(corrected):
-            return corrected, max(best_conf, 0.85), plate_colour, vehicle_class, True
-        if self.regex.match(best_text):
-            return best_text, max(best_conf, 0.80), plate_colour, vehicle_class, True
+            if self.regex.match(corrected):
+                return corrected, max(conf, 0.88)
+            if self.regex.match(raw):
+                return raw, max(conf, 0.82)
 
-        if len(corrected) >= 5:
-            return corrected, best_conf * 0.75, plate_colour, vehicle_class, True
-        return None, 0.0, plate_colour, vehicle_class, True
+            if conf > best_conf and len(corrected) >= 6:
+                best_text, best_conf = corrected, conf
+
+        if best_text and len(best_text) >= 6:
+            fixed = disambiguate_indian_plate(best_text)
+            if self.regex.match(fixed):
+                return fixed, max(best_conf, 0.82)
+            return fixed, max(best_conf, 0.70)
+
+        return None, 0.0
+
+    def read(self, crop: np.ndarray) -> Tuple[Optional[str], float]:
+        """Read plate from a vehicle crop (used by async OCR worker).
+        Tries reference pipeline first, then extended Indian pipeline."""
+        if crop is None or crop.size == 0:
+            return None, 0.0
+
+        # Step 1: Isolate plate region using YOLOv8
+        plate_crop_img = self.isolate_plate(crop)
+
+        # Step 2: Try reference pipeline (grayscale → THRESH_BINARY_INV → readtext)
+        if plate_crop_img is not crop:
+            gray = cv2.cvtColor(plate_crop_img, cv2.COLOR_BGR2GRAY)
+            _, thresh = cv2.threshold(gray, 64, 255, cv2.THRESH_BINARY_INV)
+            text, score = read_license_plate_ref(self._lazy(), thresh)
+            if text is not None:
+                return text, score
+
+        # Step 3: Try extended Indian plate pipeline on isolated crop
+        text, score = self._read_indian(plate_crop_img)
+        if text is not None:
+            return text, score
+
+        # Step 4: If plate isolation failed, try on entire vehicle crop
+        if plate_crop_img is not crop:
+            text, score = self._read_indian(crop)
+            if text is not None:
+                return text, score
+
+        return None, 0.0
 
     def is_valid(self, plate: Optional[str]) -> bool:
-        if not plate:
-            return False
-        return bool(self.regex.match(plate) or
-                    self.STANDARD_REGEX.match(plate) or
-                    self.BH_REGEX_PAT.match(plate))
+        return bool(plate and self.regex.match(plate))
 
 
-# ====================================================================== #
-# Async OCR Worker (same architecture, enhanced results)
-# ====================================================================== #
+# ---------------------------------------------------------------------------
+# Async OCR worker thread
+# ---------------------------------------------------------------------------
 
 class OCRWorker:
     def __init__(self, cfg):
@@ -436,7 +425,6 @@ class OCRWorker:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.processed = 0
-        self._failed_tracks: Dict[int, int] = {}  # track_id -> consecutive failures
 
     def start(self) -> OCRWorker:
         if not self.cfg.enabled:
@@ -452,28 +440,16 @@ class OCRWorker:
             except queue.Empty:
                 continue
             try:
-                plate, conf, colour, vclass, is_hsrp = self.reader.read(job.crop)
+                plate, conf = self.reader.read(job.crop)
             except Exception:
-                plate, conf, colour, vclass, is_hsrp = None, 0.0, "UNKNOWN", "UNKNOWN", True
-
+                plate, conf = None, 0.0
             self.processed += 1
             with self._lock:
                 prev = self._results.get(job.track_id)
                 if plate and (prev is None or conf > prev.confidence):
-                    self._results[job.track_id] = OCRResult(
-                        job.track_id, plate, conf,
-                        plate_colour=colour, vehicle_class=vclass,
-                        is_hsrp=is_hsrp,
-                        format_type="BH" if BH_REGEX.match(plate or "") else "STANDARD"
-                    )
-                    self._failed_tracks.pop(job.track_id, None)
+                    self._results[job.track_id] = OCRResult(job.track_id, plate, conf)
                 elif prev is None:
-                    self._results[job.track_id] = OCRResult(
-                        job.track_id, None, 0.0,
-                        plate_colour=colour, vehicle_class=vclass,
-                        is_hsrp=is_hsrp
-                    )
-                    self._failed_tracks[job.track_id] = self._failed_tracks.get(job.track_id, 0) + 1
+                    self._results[job.track_id] = OCRResult(job.track_id, None, 0.0)
 
     # ------------------------------------------------------------------ #
 
@@ -497,12 +473,6 @@ class OCRWorker:
         with self._lock:
             return self._results.get(track_id)
 
-    def is_non_hsrp_candidate(self, track_id: int) -> bool:
-        """True if the track has failed OCR enough times to suggest a
-        non-HSRP / hand-painted plate (itself a CMVR Rule 50 violation)."""
-        with self._lock:
-            return self._failed_tracks.get(track_id, 0) >= self.cfg.max_attempts_per_track
-
     @property
     def backlog(self) -> int:
         return self._q.qsize()
@@ -513,25 +483,31 @@ class OCRWorker:
             self._thread.join(timeout=1.0)
 
 
-# ====================================================================== #
-# Plate Crop Extraction
-# ====================================================================== #
+# ---------------------------------------------------------------------------
+# Utility crop function used by engine.py
+# ---------------------------------------------------------------------------
 
 def plate_crop(frame: np.ndarray, bbox, min_h: int) -> Optional[np.ndarray]:
-    """Crop the bumper/plate-bearing region of a vehicle."""
+    """Crop the bumper/plate-bearing region of a vehicle for plate detection."""
     h_img, w_img = frame.shape[:2]
     x1, y1, x2, y2 = bbox
     w = x2 - x1
     h = y2 - y1
 
-    if w < 30 or h < 30:
+    if w < 24 or h < 24:
         return None
 
-    # Focus on the lower 42% of the vehicle body
-    y1_crop = max(0, int(y1 + 0.58 * h))
-    y2_crop = min(h_img, int(y2 + 0.06 * h))
-    x1_crop = max(0, int(x1 - 0.04 * w))
-    x2_crop = min(w_img, int(x2 + 0.04 * w))
+    # For small vehicles/motorcycles (h < 90), use the full vehicle region
+    if h < 90:
+        y1_crop = max(0, int(y1 - 0.05 * h))
+        y2_crop = min(h_img, int(y2 + 0.05 * h))
+    else:
+        # Focus on lower 55% where front/rear plates are located
+        y1_crop = max(0, int(y1 + 0.45 * h))
+        y2_crop = min(h_img, int(y2 + 0.08 * h))
+
+    x1_crop = max(0, int(x1 - 0.06 * w))
+    x2_crop = min(w_img, int(x2 + 0.06 * w))
 
     if y2_crop <= y1_crop or x2_crop <= x1_crop:
         return None

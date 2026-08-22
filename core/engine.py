@@ -1,4 +1,4 @@
-﻿"""Pipeline orchestrator.
+"""Pipeline orchestrator.
 
 Per-frame ordering is chosen so nothing blocking sits on the critical path:
 
@@ -28,7 +28,8 @@ from .detector import Detector
 from .evidence import EvidenceWriter
 from .geometry import GroundPlane
 from .helmet import HelmetClassifier
-from .ocr_worker import OCRWorker, plate_crop
+from .ocr_worker import OCRWorker, plate_crop, get_car
+from .alerts import TelegramAlertService, AlertJob
 from .scene_graph import SceneGraphBuilder
 from .tracks import TrackRegistry
 from .violations import ViolationEngine
@@ -48,6 +49,7 @@ class TrafficSentinel:
         self.rules = ViolationEngine(cfg, cfg.geometry, self.ground,
                                      self.helmet)
         self.ocr = OCRWorker(cfg.ocr).start()
+        self.alerts = TelegramAlertService(getattr(cfg, 'alerts', None) or AlertConfig()).start()
         self.db = Database(cfg.db_path)
         self.evidence = EvidenceWriter(cfg.evidence, fps,
                                        cfg.geometry.camera_id)
@@ -65,6 +67,12 @@ class TrafficSentinel:
     def process(self, frame: np.ndarray, frame_idx: int,
                 draw: bool = True) -> Dict:
         t0 = time.perf_counter()
+
+        self.rules.cfg = self.cfg.rules
+        self.rules.geo = self.cfg.geometry
+        self.annotator.geo = self.cfg.geometry
+        if hasattr(self.cfg, 'alerts'):
+            self.alerts.cfg = self.cfg.alerts
 
         detections = self.detector.detect(frame)
         self.registry.update(detections, frame_idx)
@@ -112,9 +120,60 @@ class TrafficSentinel:
     # ------------------------------------------------------------------ #
 
     def _dispatch_ocr(self, frame, graph) -> None:
-        """Submit crops per frame for vehicles that still need a plate or have unvalidated reads."""
+        """Two-stage plate detection:
+
+        Stage 1 (from reference main.py): Run YOLOv8 license_plate_detector on
+        the FULL FRAME, crop each plate, threshold (BINARY_INV at 64), OCR, and
+        assign to the parent vehicle via get_car() containment check.
+
+        Stage 2 (fallback): For vehicles that Stage 1 missed, submit a bumper
+        crop to the async OCR worker thread.
+        """
         if not self.cfg.ocr.enabled:
             return
+
+        # ----- Stage 1: Full-frame plate detection (reference main.py) -----
+        # Build vehicle_track_ids list: [[x1, y1, x2, y2, track_id], ...]
+        vehicle_bboxes = []
+        track_map = {}  # track_id -> track object
+        for vnode in graph.vehicles():
+            tr = vnode.det.get("_track")
+            if tr is None:
+                continue
+            x1, y1, x2, y2 = vnode.bbox
+            vehicle_bboxes.append([x1, y1, x2, y2, tr.track_id])
+            track_map[tr.track_id] = tr
+
+        # Detect license plates in full frame (reference: license_plates = license_plate_detector(frame)[0])
+        plates = self.ocr.reader.detect_plates_in_frame(frame)
+
+        for plate_info in plates:
+            px1, py1, px2, py2 = plate_info["bbox"]
+            plate_text = plate_info["text"]
+            plate_score = plate_info["text_score"]
+
+            if plate_text is None:
+                continue
+
+            # Assign plate to car (reference: get_car(license_plate, track_ids))
+            _, _, _, _, car_id = get_car([px1, py1, px2, py2], vehicle_bboxes)
+
+            if car_id != -1 and car_id in track_map:
+                tr = track_map[car_id]
+                if plate_score > tr.plate_conf:
+                    tr.plate = plate_text
+                    tr.plate_conf = plate_score
+                    # Persist to DB and update live feed immediately
+                    self.db.log_sighting(plate_text, self.cfg.geometry.camera_id,
+                                         self.cfg.geometry.latitude,
+                                         self.cfg.geometry.longitude,
+                                         bool(tr.logged))
+                    self.db.update_violation_plate(car_id, plate_text, plate_score)
+                    for item in self.live_violations:
+                        if item.get("track_id") == car_id and not item.get("plate"):
+                            item["plate"] = plate_text
+
+        # ----- Stage 2: Async fallback for vehicles still without plates -----
         budget = 3
         for vnode in graph.vehicles():
             if budget <= 0:
@@ -122,14 +181,17 @@ class TrafficSentinel:
             tr = vnode.det.get("_track")
             if tr is None:
                 continue
-            # If already has high confidence plate, skip
             if tr.plate and tr.plate_conf > 0.80:
                 continue
             if tr.ocr_attempts >= self.cfg.ocr.max_attempts_per_track:
                 continue
+
+            last_frame = getattr(tr, "_last_ocr_submit", -10)
+            if hasattr(tr, "last_frame") and tr.last_frame - last_frame < 3:
+                continue
+
             x1, y1, x2, y2 = vnode.bbox
             h = y2 - y1
-            # Best OCR happens when vehicle is close (h >= 50 px)
             if h < self.cfg.ocr.min_crop_height:
                 continue
             crop = plate_crop(frame, vnode.bbox, self.cfg.ocr.min_crop_height)
@@ -137,7 +199,9 @@ class TrafficSentinel:
                 continue
             if self.ocr.submit(tr.track_id, crop):
                 tr.ocr_attempts += 1
+                tr._last_ocr_submit = getattr(tr, "last_frame", 0)
                 budget -= 1
+
 
     def _collect_ocr(self) -> None:
         for tid, tr in self.registry.tracks.items():
@@ -151,6 +215,11 @@ class TrafficSentinel:
                                      self.cfg.geometry.latitude,
                                      self.cfg.geometry.longitude,
                                      bool(tr.logged))
+                # Retroactively update database record and live list so review queue shows plate
+                self.db.update_violation_plate(tid, res.plate, res.confidence)
+                for item in self.live_violations:
+                    if item.get("track_id") == tid and not item.get("plate"):
+                        item["plate"] = res.plate
 
     # ------------------------------------------------------------------ #
 
@@ -197,6 +266,24 @@ class TrafficSentinel:
                 evidence_path=crop_path, clip_path=clip_path,
                 lat=self.cfg.geometry.latitude,
                 lon=self.cfg.geometry.longitude)
+
+            # Dispatch real-time Telegram mobile alert
+            try:
+                self.alerts.dispatch(AlertJob(
+                    vtype=v.vtype,
+                    track_id=v.track_id,
+                    severity=v.severity,
+                    confidence=v.confidence,
+                    fine=v.fine,
+                    plate=plate,
+                    camera_id=self.cfg.geometry.camera_id,
+                    lat=self.cfg.geometry.latitude,
+                    lon=self.cfg.geometry.longitude,
+                    reasons=v.reasons,
+                    evidence_path=crop_path
+                ))
+            except Exception:
+                pass
 
             record = {
                 "type": v.vtype, "track_id": v.track_id,
@@ -256,6 +343,7 @@ class TrafficSentinel:
 
     def close(self) -> None:
         self.ocr.stop()
+        self.alerts.stop()
         self.evidence.stop()
         self.db.close()
 
